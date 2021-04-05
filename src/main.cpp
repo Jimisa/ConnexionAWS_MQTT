@@ -1,34 +1,37 @@
+#include <esp_system.h>
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 extern "C" {
 	#include "freertos/FreeRTOS.h"
 	#include "freertos/timers.h"
 }
 #include <AsyncMqttClient.h>
-
-#include <WiFiClientSecure.h>
-//#include <MQTTClient.h>
 #include <ArduinoJson.h>
-#include <secrets.h>
+
 #include <bsec.h>
 
+#include <secrets.h>
+
 const uint8_t bsec_config_iaq[] = {
-#include "config/generic_33v_3s_28d/bsec_iaq.txt"
+#include "config/generic_33v_300s_28d/bsec_iaq.txt"
 };
+const uint32_t STATE_SAVE_PERIOD=(1 * 60 * 60 * 1000); // each 6 hours or 4 times a day
 
-
+// Wifi & MQTT
 WiFiClient wificlient;
-//MQTTClient mqttclient(256);
+uint8_t resetCounter=0; 
 AsyncMqttClient amqttclient;
 TimerHandle_t mqttReconnectTimer;
-TimerHandle_t bmegetDataTimer;
 
+// BME680
 Bsec bme_dev;
+uint8_t bsecState[BSEC_MAX_STATE_BLOB_SIZE]= {0};
+uint16_t stateUpdateCounter = 0;
+uint32_t lastTime = 0;
 
-/*******************************************************
-HELPERS FUNCTIONS
-********************************************************/
-
+/* #region Helpers */
 /*!
  * @brief Get the Mac address of the ESP network interface
  *
@@ -52,6 +55,7 @@ String MACasString() {
     ID += String(mac[i],HEX);
     if (i != 5) ID+= ":";
   }
+  log_v(" MAC Address is : %s",ID);
   return ID;
 }
 
@@ -65,10 +69,9 @@ String MACasString() {
  * 
  * @return None
  * 
- * \code{.c}
- *  errLeds();
- * \endcode
- * 
+ \code{.c}
+  errLeds();
+ \endcode
 */
 void errLeds(int led_pin = 2)
 {
@@ -88,42 +91,124 @@ void errLeds(int led_pin = 2)
  * @param
  * @return None
  * 
- * \code{.c}
- *  checkBmeSensorStatus();
- * \endcode
- * 
+ \code{.c}
+  checkBmeSensorStatus();
+ \endcode
 */
 void checkBmeSensorStatus(void)
 {
   String output="";
   if (bme_dev.status != BSEC_OK) {
     if (bme_dev.status < BSEC_OK) {
-      output = "BSEC error code : " + String(bme_dev.status);
-      Serial.println(output);
+      log_e(" BSEC error code : %d",bme_dev.status);
       for (;;)
         errLeds(); /* Halt in case of failure */
     } else {
-      output = "BSEC warning code : " + String(bme_dev.status);
-      Serial.println(output);
+      log_w("BSEC warning code : %d",bme_dev.status);
     }
   }
 
   if (bme_dev.bme680Status != BME680_OK) {
     if (bme_dev.bme680Status < BME680_OK) {
-      output = "BME680 error code : " + String(bme_dev.bme680Status);
-      Serial.println(output);
+      log_e(" BME680 error code : %d",bme_dev.status);
+      // output = "BME680 error code : " + String(bme_dev.bme680Status);
+      // Serial.println(output);
       for (;;)
         errLeds(); /* Halt in case of failure */
     } else {
-      output = "BME680 warning code : " + String(bme_dev.bme680Status);
-      Serial.println(output);
+      log_w(" BME680 error code : %d",bme_dev.status);
+      // output = "BME680 warning code : " + String(bme_dev.bme680Status);
+      // Serial.println(output);
     }
   }
 }
 
-
 void connectToMqtt() {
   amqttclient.connect();
+}
+
+/*!
+ * @brief Check if state is saved in EEPROM and load it
+ *
+ * This function helps the sensor to get a recent state to start with, 
+ * speeding up trimming and calibrating virtual outputs
+ * 
+ * @param
+ * @return void
+ * 
+ \code{.c}
+  loadState();
+ \endcode 
+*/
+void loadState() {
+  if (EEPROM.read(0) == BSEC_MAX_STATE_BLOB_SIZE) {
+    // Existing state in EEPROM
+    log_i("Reading state from EEPROM : ");
+    //Serial.println("Reading state from EEPROM");
+
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE; i++) {
+      bsecState[i] = EEPROM.read(i + 1);
+      log_v("Byte [%d] : %#x",i,bsecState[i]);
+    }
+    
+    bme_dev.setState(bsecState);
+    checkBmeSensorStatus();
+  } else {
+    // Erase the EEPROM with zeroes
+    log_i("Erasing EEPROM");
+    //Serial.println("Erasing EEPROM");
+
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE + 1; i++)
+      EEPROM.write(i, 0);
+
+    EEPROM.commit();
+  }
+}
+
+/*!
+ * @brief Save BSEC state in EEPROM
+ *
+ * If time's up, use EEPROM to save state. The save rate is defined in global const STATE_SAVE_PERIOD (in ms)
+ * 
+ * @param
+ * @return void
+ * 
+ \code{.c}
+  saveState();
+ \endcode 
+*/
+void saveState() {
+  bool update = false;
+  if (stateUpdateCounter == 0) {
+    /* Set a trigger to save the state. Here, the state is saved every STATE_SAVE_PERIOD with the first state being saved once the algorithm achieves full calibration, i.e. iaqAccuracy = 3 */
+    if (bme_dev.iaqAccuracy >= 3) {
+      update = true;
+      stateUpdateCounter++;
+    }
+  } else {
+    /* Update every STATE_SAVE_PERIOD milliseconds */
+    if ((stateUpdateCounter * STATE_SAVE_PERIOD) < millis()) {
+      update = true;
+      stateUpdateCounter++;
+    }
+  }
+
+  if (update) {
+    bme_dev.getState(bsecState);
+    checkBmeSensorStatus();
+
+    log_i("Writing state to EEPROM");
+    //Serial.println("Writing state to EEPROM");
+
+    for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE ; i++) {
+      EEPROM.write(i + 1, bsecState[i]);
+      Serial.println(bsecState[i], HEX);
+      log_v("byte [%d] : %#x",i,bsecState[i]);
+    }
+
+    EEPROM.write(0, BSEC_MAX_STATE_BLOB_SIZE);
+    EEPROM.commit();
+  }
 }
 
 /*!
@@ -135,10 +220,10 @@ void connectToMqtt() {
  * @param
  * @return None
  * 
- * \code{.c}
- *  publishMQTT();
- * \endcode
- * 
+ \code{.c}
+  publishMQTT();
+ \endcode
+  
 */
 void publishMQTT() {
   if (bme_dev.run()) {
@@ -156,12 +241,13 @@ void publishMQTT() {
 
     size_t n= serializeJson(doc, output);
     amqttclient.publish("esp32/pub",2, true, output,n);
-    Serial.println(String(output));
+    log_i("Publish : %s",output);
+    //Serial.println(String(output));
+    saveState();
   } else {
     checkBmeSensorStatus();
   }
 }
-
 
 /*!
  * @brief handler function for main WiFi events
@@ -174,37 +260,33 @@ void publishMQTT() {
  * 
  * @return None
  * 
- * \code{.c}
- *  WiFi.onEvent(wifiEventHandler);
- * \endcode
- * 
+ \code{.c}
+   WiFi.onEvent(wifiEventHandler);
+ \endcode
+  
 */
 void wifiEventHandler(WiFiEvent_t wifi_event,WiFiEventInfo_t wifi_event_info) {
   switch (wifi_event) {
-    case SYSTEM_EVENT_STA_CONNECTED:
-      //Serial.println(String(millis())+" - Connected to AP "+WIFI_SSID);
-      //Serial.println(wifi_event);
+    case SYSTEM_EVENT_STA_DISCONNECTED: // deconnexion from AP
+      // Try 5 times to reconnect to WiFi. Reset the system otherwise.
+      if (resetCounter < 5) {
+        resetCounter++;
+        xTimerStop(mqttReconnectTimer, 0);
+        WiFi.disconnect();
+        WiFi.reconnect();
+      }
+      else {
+        ESP.restart();
+      }
       break;
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-      //Serial.println(String(millis())+" - Disconnected from WiFi AP. Trying to reconnect...");
-      Serial.println("Disconnected from WiFi");
-      xTimerStop(mqttReconnectTimer, 0);
-      WiFi.disconnect();
-      WiFi.reconnect();
-      break;
-    case SYSTEM_EVENT_STA_GOT_IP:
-      Serial.println("Connected to wifi");
-      //Serial.print(String(millis())+" - IP : ");
-      //Serial.println(WiFi.localIP());
-      //Serial.println(String(millis())+" - RSSI ["+WiFi.RSSI()+" dB]");
+    case SYSTEM_EVENT_STA_GOT_IP: // connected and got an IP
+      resetCounter=0;
       connectToMqtt();
       break;
     default:
-      //Serial.println(wifi_event);
       break;
   }
 }
-
 
 /*!
  * @brief Callback function associated with MQTT connexion state.
@@ -215,13 +297,14 @@ void wifiEventHandler(WiFiEvent_t wifi_event,WiFiEventInfo_t wifi_event_info) {
  * 
  * @return None
  * 
- * \code{.c}
- *  amqttclient.onConnect(onMqttConnect);
- * \endcode
- * 
-*/
+ \code{.c}
+  amqttclient.onConnect(onMqttConnect);
+ \endcode
+ 
+ */
 void onMqttConnect(bool sessionPresent) {
-  Serial.println("Connected to MQTT");
+  //Serial.println("Connected to MQTT");
+  log_i("Connected");
   //uint16_t packetIdSub = amqttclient.subscribe("esp32/sub", 2);
   //uint16_t packetIdPub1 = amqttclient.publish("esp32/connection", 1, true, "connected");
 }
@@ -235,13 +318,14 @@ void onMqttConnect(bool sessionPresent) {
  * 
  * @return None
  * 
- * \code{.c}
- *  amqttclient.onConnect(onMqttDisconnect);
- * \endcode
- * 
+ \code{.c}
+  amqttclient.onConnect(onMqttDisconnect);
+ \endcode
+ 
 */
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
-  Serial.println("Disconnected from MQTT");
+  //Serial.println("Disconnected from MQTT");
+  log_w("Disconnected");
   //Serial.println(String(millis())+" - Disconnected from MQTT broker : "+String(int8_t(reason)));
   if (WiFi.isConnected()) {
     xTimerStart(mqttReconnectTimer, 0);
@@ -258,16 +342,17 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
  * 
  * @return None
  * 
- * \code{.c}
- *  amqttclient.onConnect(onMqttSubscribe);
- * \endcode
- * 
+ \code{.c}
+  amqttclient.onConnect(onMqttSubscribe);
+ \endcode
+ 
 */
 void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
-  Serial.println("Subscribe acknowledged.");
-  Serial.print("  packetId: ");
-  Serial.println(packetId);
-  Serial.print("  qos: ");
+  log_i("Subscribe acknowledged. PacketId : %d, qos : %d",packetId, qos);
+  // Serial.println("Subscribe acknowledged.");
+  // Serial.print("  packetId: ");
+  // Serial.println(packetId);
+  // Serial.print("  qos: ");
   //Serial.println(qos);
 }
 
@@ -286,13 +371,14 @@ void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
  * 
  * @return None
  * 
- * \code{.c}
- *  amqttclient.onConnect(onMqttMessage);
- * \endcode
- * 
+ \code{.c}
+  amqttclient.onConnect(onMqttMessage);
+ \endcode
+ 
 */
 void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total){
-  Serial.println("incoming message : "+String(topic)+" - "+payload);
+  //Serial.println("incoming message : "+String(topic)+" - "+payload);
+  log_i("Incoming subscribed message. Topic : %s, payload : %s",topic, payload);
 }
 
 /*!
@@ -304,20 +390,25 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
  * 
  * @return None
  * 
- * \code{.c}
- *  amqttclient.onConnect(onMqttPublish);
- * \endcode
- * 
+ \code{.c}
+  amqttclient.onConnect(onMqttPublish);
+ \endcode
+ 
 */
 void onMqttPublish(uint16_t packetId) {
-  Serial.println("Publish acknowledged.");
-  Serial.print("  packetId: ");
-  Serial.println(packetId);
+  log_i("Publish acknowledged. PacketId : %d",packetId); 
+  // Serial.println("Publish acknowledged.");
+  // Serial.print("  packetId: ");
+  // Serial.println(packetId);
 }
+/* #endregion Helpers */
 
 void setup() { 
   Serial.begin(115200);
-  Serial.setDebugOutput(false);
+  //Serial.setDebugOutput(false);
+  EEPROM.begin(BSEC_MAX_STATE_BLOB_SIZE + 1); // initialize the size of the memory. Required for ESP32 (and update not working also)
+  log_v("Size of EEPROM : %d",EEPROM.length());
+  //Serial.println("Size of EEPROM : "+EEPROM.length());
 
   //------------------------------------------
   //WiFi and MQTT settings
@@ -344,6 +435,8 @@ void setup() {
 
   bme_dev.setConfig(bsec_config_iaq);
 
+  loadState();
+
   bsec_virtual_sensor_t sensorList[4] = {
     BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,
     BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE,
@@ -355,8 +448,6 @@ void setup() {
 }
 
 void loop() {
-
-     publishMQTT();
-     
+  publishMQTT();
 }
 
