@@ -12,8 +12,15 @@ extern "C" {
 
 #include <bsec.h>
 
-#include <secrets.h>
+#ifdef ASYNC_TCP_SSL_ENABLED //doesn't work with ESP32
+#define MQTT_SECURE true
+#define MQTT_SERVER_FINGERPRINT {0x08, 0xf8, 0x95, 0xdc, 0x66, 0x4e, 0xa9, 0x0c, 0x67, 0xc7, 0x41, 0xad, 0x4f, 0x69, 0xd9, 0xda, 0x8a, 0x20, 0x4b, 0xf2}
+#define MQTT_PORT 8883
+#else
+#define MQTT_PORT 1883
+#endif
 
+#include <secrets.h>
 const uint8_t bsec_config_iaq[] = {
 #include "config/generic_33v_300s_28d/bsec_iaq.txt"
 };
@@ -422,8 +429,14 @@ void setup() {
   amqttclient.onSubscribe(onMqttSubscribe);
   amqttclient.onPublish(onMqttPublish);
   amqttclient.onMessage(onMqttMessage);
-  amqttclient.setServer(BROKER_ADDR,BROKER_PORT);
+  amqttclient.setServer(BROKER_ADDR,MQTT_PORT);
   amqttclient.setKeepAlive(90);
+  #if ASYNC_TCP_SSL_ENABLED
+    amqttclient.setSecure(true);
+    if (MQTT_SECURE) {
+      amqttclient.addServerFingerprint((const uint8_t[])MQTT_SERVER_FINGERPRINT);
+    }
+  #endif
 
   WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
 
