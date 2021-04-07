@@ -1,4 +1,3 @@
-#include <esp_system.h>
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <WiFi.h>
@@ -7,30 +6,39 @@ extern "C" {
 	#include "freertos/FreeRTOS.h"
 	#include "freertos/timers.h"
 }
-#include <AsyncMqttClient.h>
+#include <MQTTClient.h>
 #include <ArduinoJson.h>
 
 #include <bsec.h>
 
-#ifdef ASYNC_TCP_SSL_ENABLED //doesn't work with ESP32
-#define MQTT_SECURE true
-#define MQTT_SERVER_FINGERPRINT {0x08, 0xf8, 0x95, 0xdc, 0x66, 0x4e, 0xa9, 0x0c, 0x67, 0xc7, 0x41, 0xad, 0x4f, 0x69, 0xd9, 0xda, 0x8a, 0x20, 0x4b, 0xf2}
-#define MQTT_PORT 8883
+// #ifdef ASYNC_TCP_SSL_ENABLED //doesn't work with ESP32
+// #define MQTT_SECURE true
+// #define MQTT_SERVER_FINGERPRINT {0x08, 0xf8, 0x95, 0xdc, 0x66, 0x4e, 0xa9, 0x0c, 0x67, 0xc7, 0x41, 0xad, 0x4f, 0x69, 0xd9, 0xda, 0x8a, 0x20, 0x4b, 0xf2}
+// #define MQTT_PORT 8883
+// #else
+// #define MQTT_PORT 1883
+// #endif
+#ifdef LOCAL_MQTT_BROKER
+#include <secrets_local.h>
 #else
-#define MQTT_PORT 1883
+#include <secrets.h>
 #endif
 
-#include <secrets.h>
 const uint8_t bsec_config_iaq[] = {
 #include "config/generic_33v_300s_28d/bsec_iaq.txt"
 };
 const uint32_t STATE_SAVE_PERIOD=(1 * 60 * 60 * 1000); // each 6 hours or 4 times a day
 
 // Wifi & MQTT
-WiFiClient wificlient;
+#if TSL_ENABLED == 0
+  WiFiClient wificlient;
+#else
+  WiFiClientSecure netClientSecure = WiFiClientSecure();
+#endif
 uint8_t resetCounter=0; 
-AsyncMqttClient amqttclient;
-TimerHandle_t mqttReconnectTimer;
+//AsyncMqttClient amqttclient;
+MQTTClient mqttClient = MQTTClient(256);
+//TimerHandle_t mqttReconnectTimer;
 
 // BME680
 Bsec bme_dev;
@@ -131,7 +139,8 @@ void checkBmeSensorStatus(void)
 }
 
 void connectToMqtt() {
-  amqttclient.connect();
+  while(!mqttClient.connect(THINGNAME)) {delay(5000);};
+  log_d("MQTT connected %d",mqttClient.returnCode());
 }
 
 /*!
@@ -233,6 +242,11 @@ void saveState() {
   
 */
 void publishMQTT() {
+  while(!mqttClient.connected()) {
+    log_w("MQTT disconnected %d",mqttClient.lastError());
+    connectToMqtt();
+  }
+  
   if (bme_dev.run()) {
     StaticJsonDocument<128> doc;
     char output[256];
@@ -247,8 +261,19 @@ void publishMQTT() {
 
 
     size_t n= serializeJson(doc, output);
-    amqttclient.publish("esp32/pub",2, true, output,n);
-    log_i("Publish : %s",output);
+    if (mqttClient.connected()) {
+      if (mqttClient.publish("esp32/pub",output,n,true,2)) {
+        log_i("Publish : %s",output);
+      } else {
+        log_e("Publish unsuccessful : %d",mqttClient.lastError());
+      }
+    } else {
+        if (WiFi.isConnected()) {
+          //xTimerStart(mqttReconnectTimer, 0);
+          connectToMqtt();
+        }
+    }
+    
     //Serial.println(String(output));
     saveState();
   } else {
@@ -278,7 +303,8 @@ void wifiEventHandler(WiFiEvent_t wifi_event,WiFiEventInfo_t wifi_event_info) {
       // Try 5 times to reconnect to WiFi. Reset the system otherwise.
       if (resetCounter < 5) {
         resetCounter++;
-        xTimerStop(mqttReconnectTimer, 0);
+        if (mqttClient.connected()) {mqttClient.disconnect();};
+        //xTimerStop(mqttReconnectTimer, 0);
         WiFi.disconnect();
         WiFi.reconnect();
       }
@@ -309,12 +335,12 @@ void wifiEventHandler(WiFiEvent_t wifi_event,WiFiEventInfo_t wifi_event_info) {
  \endcode
  
  */
-void onMqttConnect(bool sessionPresent) {
-  //Serial.println("Connected to MQTT");
-  log_i("Connected");
-  //uint16_t packetIdSub = amqttclient.subscribe("esp32/sub", 2);
-  //uint16_t packetIdPub1 = amqttclient.publish("esp32/connection", 1, true, "connected");
-}
+// void onMqttConnect(bool sessionPresent) {
+//   //Serial.println("Connected to MQTT");
+//   log_i("Connected");
+//   //uint16_t packetIdSub = amqttclient.subscribe("esp32/sub", 2);
+//   //uint16_t packetIdPub1 = amqttclient.publish("esp32/connection", 1, true, "connected");
+// }
 
 /*!
  * @brief Callback function associated with MQTT disconnection state.
@@ -330,14 +356,14 @@ void onMqttConnect(bool sessionPresent) {
  \endcode
  
 */
-void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
-  //Serial.println("Disconnected from MQTT");
-  log_w("Disconnected");
-  //Serial.println(String(millis())+" - Disconnected from MQTT broker : "+String(int8_t(reason)));
-  if (WiFi.isConnected()) {
-    xTimerStart(mqttReconnectTimer, 0);
-  }
-}
+// void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+//   //Serial.println("Disconnected from MQTT");
+//   log_w("Disconnected");
+//   //Serial.println(String(millis())+" - Disconnected from MQTT broker : "+String(int8_t(reason)));
+//   if (WiFi.isConnected()) {
+//     xTimerStart(mqttReconnectTimer, 0);
+//   }
+// }
 
 /*!
  * @brief Callback function associated with MQTT subscribe state.
@@ -354,14 +380,14 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
  \endcode
  
 */
-void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
-  log_i("Subscribe acknowledged. PacketId : %d, qos : %d",packetId, qos);
-  // Serial.println("Subscribe acknowledged.");
-  // Serial.print("  packetId: ");
-  // Serial.println(packetId);
-  // Serial.print("  qos: ");
-  //Serial.println(qos);
-}
+// void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
+//   log_i("Subscribe acknowledged. PacketId : %d, qos : %d",packetId, qos);
+//   // Serial.println("Subscribe acknowledged.");
+//   // Serial.print("  packetId: ");
+//   // Serial.println(packetId);
+//   // Serial.print("  qos: ");
+//   //Serial.println(qos);
+// }
 
 /*!
  * @brief Callback function associated with MQTT incoming message state.
@@ -370,11 +396,6 @@ void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
  *
  * @param [out]     topic       topic the client subscribes to
  * @param [out]     payload     the message content
- * @param [out]     properties  
- * @param [out]     len     
- * @param [out]     index     
- * @param [out]     total     
- * 
  * 
  * @return None
  * 
@@ -383,8 +404,7 @@ void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
  \endcode
  
 */
-void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total){
-  //Serial.println("incoming message : "+String(topic)+" - "+payload);
+void onMqttMessage(String &topic, String &payload) {//, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total){
   log_i("Incoming subscribed message. Topic : %s, payload : %s",topic, payload);
 }
 
@@ -402,43 +422,48 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
  \endcode
  
 */
-void onMqttPublish(uint16_t packetId) {
-  log_i("Publish acknowledged. PacketId : %d",packetId); 
-  // Serial.println("Publish acknowledged.");
-  // Serial.print("  packetId: ");
-  // Serial.println(packetId);
-}
+// void onMqttPublish(uint16_t packetId) {
+//   log_i("Publish acknowledged. PacketId : %d",packetId); 
+//   // Serial.println("Publish acknowledged.");
+//   // Serial.print("  packetId: ");
+//   // Serial.println(packetId);
+// }
 /* #endregion Helpers */
 
 void setup() { 
   Serial.begin(115200);
-  //Serial.setDebugOutput(false);
+  #if CORE_DEBUG_LEVEL > 5
+    Serial.setDebugOutput(false);
+  #endif
+  
   EEPROM.begin(BSEC_MAX_STATE_BLOB_SIZE + 1); // initialize the size of the memory. Required for ESP32 (and update not working also)
   log_v("Size of EEPROM : %d",EEPROM.length());
-  //Serial.println("Size of EEPROM : "+EEPROM.length());
 
   //------------------------------------------
   //WiFi and MQTT settings
   //------------------------------------------
-  mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
+  //mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
   
   WiFi.onEvent(wifiEventHandler);
 
-  amqttclient.onConnect(onMqttConnect);
-  amqttclient.onDisconnect(onMqttDisconnect);
-  amqttclient.onSubscribe(onMqttSubscribe);
-  amqttclient.onPublish(onMqttPublish);
-  amqttclient.onMessage(onMqttMessage);
-  amqttclient.setServer(BROKER_ADDR,MQTT_PORT);
-  amqttclient.setKeepAlive(90);
-  #if ASYNC_TCP_SSL_ENABLED
-    amqttclient.setSecure(true);
-    if (MQTT_SECURE) {
-      amqttclient.addServerFingerprint((const uint8_t[])MQTT_SERVER_FINGERPRINT);
-    }
+  WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+
+  #if TSL_ENABLED == 1
+    netClientSecure.setCACert(CERT_CA);
+    netClientSecure.setCertificate(CERT_CRT);
+    netClientSecure.setPrivateKey(CERT_PRIVATE);
   #endif
 
-  WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+  Client *globalWiFiClient;
+  #if TSL_ENABLED == 1
+    globalWiFiClient = dynamic_cast<Client*> (&netClientSecure);
+  #else
+    globalWiFiClient = dynamic_cast<Client*> (&wificlient);
+  #endif
+  //netClientSecure.setInsecure();
+  mqttClient.begin(BROKER_ADDR,BROKER_PORT,*globalWiFiClient);
+  mqttClient.onMessage(onMqttMessage);
+  mqttClient.setOptions(30,true,2000); //keepAlive, clean session, timeout
 
   //------------------------------------------
   //BME680 settings
@@ -462,5 +487,6 @@ void setup() {
 
 void loop() {
   publishMQTT();
+  mqttClient.loop();
 }
 
