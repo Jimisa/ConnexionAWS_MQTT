@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"*.txt": "cpp",
+			"ssl_client.h": "c",
+			"ipaddress.h": "c"
+		}
+	}
+}

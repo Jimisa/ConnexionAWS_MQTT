@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <EEPROM.h>
+
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 extern "C" {
@@ -18,11 +19,11 @@ extern "C" {
 // #else
 // #define MQTT_PORT 1883
 // #endif
-#ifdef LOCAL_MQTT_BROKER
-#include <secrets_local.h>
-#else
+//#ifdef LOCAL_MQTT_BROKER
+//#include <secrets_local.h>
+//#else
 #include <secrets.h>
-#endif
+//#endif
 
 const uint8_t bsec_config_iaq[] = {
 #include "config/generic_33v_300s_28d/bsec_iaq.txt"
@@ -33,11 +34,12 @@ const uint32_t STATE_SAVE_PERIOD=(1 * 60 * 60 * 1000); // each 6 hours or 4 time
 #if TSL_ENABLED == 0
   WiFiClient wificlient;
 #else
-  WiFiClientSecure netClientSecure = WiFiClientSecure();
+  //WiFiClientSecure netClientSecure = WiFiClientSecure();
 #endif
+WiFiClientSecure netClientSecure = WiFiClientSecure();
 uint8_t resetCounter=0; 
 //AsyncMqttClient amqttclient;
-MQTTClient mqttClient = MQTTClient(256);
+MQTTClient mqttClient = MQTTClient(512);
 //TimerHandle_t mqttReconnectTimer;
 
 // BME680
@@ -139,7 +141,7 @@ void checkBmeSensorStatus(void)
 }
 
 void connectToMqtt() {
-  while(!mqttClient.connect(THINGNAME)) {delay(5000);};
+  while(!mqttClient.connect(THINGNAME)) {delay(10000);};
   log_d("MQTT connected %d",mqttClient.returnCode());
 }
 
@@ -242,11 +244,11 @@ void saveState() {
   
 */
 void publishMQTT() {
-  while(!mqttClient.connected()) {
-    log_w("MQTT disconnected %d",mqttClient.lastError());
-    connectToMqtt();
-  }
-  
+  // while(!mqttClient.connected()) {
+  //   log_w("MQTT disconnected %d",mqttClient.lastError());
+  //   connectToMqtt();
+  // }
+
   if (bme_dev.run()) {
     StaticJsonDocument<128> doc;
     char output[256];
@@ -261,8 +263,8 @@ void publishMQTT() {
 
 
     size_t n= serializeJson(doc, output);
-    if (mqttClient.connected()) {
-      if (mqttClient.publish("esp32/pub",output,n,true,2)) {
+    if (!mqttClient.connected()) {
+      if (mqttClient.publish("weatherstation/pub",output,n,true,1)) {
         log_i("Publish : %s",output);
       } else {
         log_e("Publish unsuccessful : %d",mqttClient.lastError());
@@ -314,7 +316,7 @@ void wifiEventHandler(WiFiEvent_t wifi_event,WiFiEventInfo_t wifi_event_info) {
       break;
     case SYSTEM_EVENT_STA_GOT_IP: // connected and got an IP
       resetCounter=0;
-      connectToMqtt();
+      //connectToMqtt();
       break;
     default:
       break;
@@ -444,9 +446,25 @@ void setup() {
   //------------------------------------------
   //mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
   
-  WiFi.onEvent(wifiEventHandler);
+  //WiFi.onEvent(wifiEventHandler);
 
+  WiFi.setHostname(THINGNAME);
   WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+
+// Only try 15 times to connect to the WiFi
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 15){
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+
+  // If we still couldn't connect to the WiFi, go to deep sleep for a minute and try again.
+  if(WiFi.status() != WL_CONNECTED){
+    esp_sleep_enable_timer_wakeup(1 * 60L * 1000000L);
+    esp_deep_sleep_start();
+  }
+  
 
   #if TSL_ENABLED == 1
     netClientSecure.setCACert(CERT_CA);
@@ -454,17 +472,21 @@ void setup() {
     netClientSecure.setPrivateKey(CERT_PRIVATE);
   #endif
 
-  Client *globalWiFiClient;
-  #if TSL_ENABLED == 1
-    globalWiFiClient = dynamic_cast<Client*> (&netClientSecure);
-  #else
-    globalWiFiClient = dynamic_cast<Client*> (&wificlient);
-  #endif
-  //netClientSecure.setInsecure();
-  mqttClient.begin(BROKER_ADDR,BROKER_PORT,*globalWiFiClient);
-  mqttClient.onMessage(onMqttMessage);
-  mqttClient.setOptions(30,true,2000); //keepAlive, clean session, timeout
+  // Client *globalWiFiClient;
+  // #if TSL_ENABLED == 1
+  //   globalWiFiClient = dynamic_cast<Client*> (&netClientSecure);
+  // #else
+  //   globalWiFiClient = dynamic_cast<Client*> (&wificlient);
+  // #endif
 
+  if (WiFi.status() == WL_CONNECTED) {
+    mqttClient.subscribe("broker/pub",1);
+    mqttClient.begin(BROKER_ADDR,BROKER_PORT,netClientSecure);//*globalWiFiClient);
+    mqttClient.onMessage(onMqttMessage);
+    mqttClient.setOptions(30,true,2000); //keepAlive, clean session, timeout
+  }
+  connectToMqtt();
+ 
   //------------------------------------------
   //BME680 settings
   //------------------------------------------
